@@ -17,12 +17,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-#set -e
+set -e
 
 export SRC_DB=movr
-export SRC_TABLES=promo_codes
+export SRC_TABLES="movr.users,movr.vehicles,movr.rides,movr.vehicle_location_histories,movr.promo_codes,movr.user_promo_codes"
 export SRC_HTTP=8090
-export SRC_PORT=26267
+export SRC_SQL_PORT=26267
+export SRC_PORT=26268
 export SRC_HOST=127.0.0.1
 
 export SINK_HTTP=8080
@@ -35,30 +36,59 @@ echo ">>> Build CDC Sink..."
 go build ../
 
 echo ">>> Start Source with Movr..."
-cockroach start-single-node --insecure --background --http-addr=:${SRC_HTTP} --listen-addr=:${SRC_PORT} --store=cockroach_source
-cockroach sql --insecure --port=${SRC_PORT} -e="SET CLUSTER SETTING kv.rangefeed.enabled = true; SET CLUSTER SETTING enterprise.license = \"${COCKROACH_DEV_LICENSE}\"; SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing';"
-cockroach workload init movr "postgresql://root@${SRC_HOST}:${SRC_PORT}/movr?sslmode=disable"
-
-echo ">>> Start Sink..."
-cockroach start-single-node --insecure --background --http-addr=:${SINK_HTTP} --listen-addr=:${SINK_PORT} --sql-addr=:${SINK_SQL_PORT} --store=cockroach_sink
-cockroach workload init movr --num-histories=9 --num-promo-codes=9 --num-rides=9 --num-users=9 --num-vehicles=9 "postgresql://root@$SINK_HOST:$SINK_SQL_PORT/movr?sslmode=disable"
-cockroach sql --insecure --port=$SINK_SQL_PORT -e="TRUNCATE TABLE MOVR.RIDES CASCADE; TRUNCATE TABLE MOVR.USERS CASCADE; TRUNCATE MOVR.VEHICLES CASCADE; TRUNCATE MOVR.VEHICLE_LOCATION_HISTORIES CASCADE; TRUNCATE TABLE MOVR.PROMO_CODES; TRUNCATE TABLE MOVR.USER_PROMO_CODES;"
-
-###TODO(Chris): Creat logic to create config for multiple tables
-echo ">>> Create CDC Sink"
-config="$(echo [{\"endpoint\":\"${SRC_TABLES}.sql\", \"source_table\":\"${SRC_TABLES}\", \"destination_database\":\"${SRC_DB}\", \"destination_table\":\"${SRC_TABLES}\"}])"
-cdc-sink --conn=postgresql://root@${SINK_HOST}:${SINK_SQL_PORT}/${SRC_DB}?sslmode=disable --port=${CDC_PORT} --config="$config" > cdc-sink.log 2>&1 &
-
-echo ">>> Create Changefeeds on Source..."
-cockroach sql --insecure --port=${SRC_PORT} -e="CREATE CHANGEFEED FOR TABLE ${SRC_DB}.${SRC_TABLES} INTO \"experimental-http://${SINK_HOST}:${CDC_PORT}/promo_codes.sql\" WITH updated,resolved;"
-
-open "http://${SRC_HOST}:${SRC_HTTP}/#/metrics/overview/cluster"
-open "http://${SINK_HOST}:${SINK_HTTP}/#/metrics/overview/cluster"
-
-cockroach sql --insecure --port=${SRC_PORT} -e="select count(*) as SourceRecords from ${SRC_DB}.${SRC_TABLES};"
-cockroach sql --insecure --port=${SINK_SQL_PORT} -e="select count(*) as TargetRecords from ${SRC_DB}.${SRC_TABLES};"
+cockroach start-single-node --advertise-addr=localhost --insecure --background --http-addr=":${SRC_HTTP}" --listen-addr=":${SRC_PORT}" --sql-addr=":${SRC_SQL_PORT}" --store=cockroach_source
+cockroach sql --insecure --port=${SRC_SQL_PORT} -e="SET CLUSTER SETTING cluster.organization = 'Cloud Kitchens Test';"
+cockroach sql --insecure --port=${SRC_SQL_PORT} -e="SET CLUSTER SETTING enterprise.license = \"${COCKROACH_DEV_LICENSE}\";"
+cockroach sql --insecure --port=${SRC_SQL_PORT} -e="SET CLUSTER SETTING kv.rangefeed.enabled = true;"
+cockroach workload init movr --num-histories=100000 --num-promo-codes=100000 --num-rides=50000 --num-users=5000 --num-vehicles=1500 "postgresql://root@${SRC_HOST}:${SRC_SQL_PORT}/movr?sslmode=disable"
 
 echo ">>> Start Movr Workload..."
-cockroach workload run movr --duration=1m --display-every=10s --concurrency=1 "postgresql://root@${SRC_HOST}:${SRC_PORT}/movr?sslmode=disable" > workload.log 2>&1 &
+cockroach workload run movr --duration=5m --display-every=10s "postgresql://root@${SRC_HOST}:${SRC_SQL_PORT}/movr?sslmode=disable" > workload.log 2>&1 &
 
-cockroach sql --insecure --port=$SINK_SQL_PORT --watch=10s -e="select count(*) as TargetRecords from ${SRC_DB}.${SRC_TABLES};"
+echo ">>> Start Sink..."
+cockroach start-single-node --advertise-addr=localhost --insecure --background --http-addr=":${SINK_HTTP}" --listen-addr=":${SINK_PORT}" --sql-addr=":${SINK_SQL_PORT}" --store=cockroach_sink
+
+echo ">>> Backup movr"
+timestamp=$(cockroach sql --insecure --port=${SRC_SQL_PORT} -e="SELECT cluster_logical_timestamp();" | grep -E "\d+\.\d+")
+
+cockroach sql --insecure --echo-sql --port=${SRC_SQL_PORT} -e="BACKUP DATABASE movr INTO 'nodelocal://self/backups/movr' AS OF SYSTEM TIME '${timestamp}';"
+mkdir -p cockroach_sink/extern/backups
+mv cockroach_source/extern/backups/movr cockroach_sink/extern/backups
+
+sleep 60
+
+echo ">>> Restore movr"
+
+cockroach sql --insecure --echo-sql --port=${SINK_SQL_PORT} -e="RESTORE DATABASE movr FROM LATEST IN 'nodelocal://self/backups/movr';"
+cockroach sql --insecure --echo-sql --port="$SINK_SQL_PORT" -e="CREATE USER cdcsink WITH LOGIN;"
+cockroach sql --insecure --echo-sql --port="$SINK_SQL_PORT" -e="GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA movr.public TO cdcsink;"
+cockroach sql --insecure --echo-sql --port="$SINK_SQL_PORT" -e="CREATE SCHEMA movr.cdcsink AUTHORIZATION cdcsink;"
+
+sleep 60
+
+echo ">>> Create Changefeeds on Source..."
+cockroach sql --insecure --echo-sql --port=${SRC_SQL_PORT} -e="CREATE CHANGEFEED FOR TABLE ${SRC_TABLES} INTO \"webhook-https://${SINK_HOST}:${CDC_PORT}/movr/public?insecure_tls_skip_verify=true\" WITH cursor='${timestamp}',updated,resolved='1s',min_checkpoint_frequency='1s',webhook_sink_config='{\"Flush\":{\"Messages\":1000,\"Frequency\":\"1s\"}}';"
+
+sleep 60
+
+echo ">>> Start CDC Sink"
+./cdc-sink start --targetConn="postgresql://cdcsink@${SINK_HOST}:${SINK_SQL_PORT}/${SRC_DB}?sslmode=disable" --stagingSchema=movr.cdcsink --disableAuthentication --foreignKeys --bindAddr=":${CDC_PORT}" --tlsSelfSigned > cdc-sink.log 2>&1 &
+
+echo ">>> Waiting ..."
+sleep 10
+
+cockroach sql --insecure --echo-sql --port="$SINK_SQL_PORT" -e="REVOKE UPDATE ON TABLE movr.public.rides FROM cdcsink;"
+
+echo ">>> Waiting ..."
+sleep 10
+
+cockroach sql --insecure --echo-sql --port="$SINK_SQL_PORT" -e="GRANT UPDATE ON TABLE movr.public.rides TO cdcsink;"
+
+echo ">>> Waiting ..."
+sleep 300
+
+echo ">>> Starting Molt"
+molt verify \
+  --schema-filter "public" \
+  --source "postgresql://root@$SRC_HOST:$SRC_SQL_PORT/movr?sslmode=disable" \
+  --target "postgresql://root@$SINK_HOST:$SINK_SQL_PORT/movr?sslmode=disable" > molt.log 2>&1 &
